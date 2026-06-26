@@ -1,3 +1,10 @@
+// ==========================================
+// 1. KONFIGURASI DAN INISIALISASI SUPABASE
+// ==========================================
+const SUPABASE_URL = "https://jcxlolhyfnpfkjuvomfo.supabase.co"; // Ganti dengan URL Supabase Anda
+const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpjeGxvbGh5Zm5wZmtqdXZvbWZvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODIxMjgxOTYsImV4cCI6MjA5NzcwNDE5Nn0.danMPOsK-xBRWpNlwYO770vZANUEIE_0vM6NKbXW5o0";                       // Ganti dengan Anon Key Supabase Anda
+const supabaseClient = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+
 const USERS = [
   { id: "admin", name: "Admin", title: "System Administrator", role: "Admin" },
   { id: "novi", name: "Novi Safitri", title: "Specialist Coordinator", role: "Requester" },
@@ -24,18 +31,62 @@ const DEFAULT_STATE = {
   sidebarOpen: false
 };
 
-let state = loadState();
+// Inisialisasi state awal dengan default structure
+let state = structuredClone(DEFAULT_STATE);
 let toastTimer;
 
-function loadState() {
-  const saved = localStorage.getItem("bibo-obi-sowi-state");
-  if (!saved) return structuredClone(DEFAULT_STATE);
-  return { ...structuredClone(DEFAULT_STATE), ...JSON.parse(saved) };
+// ==========================================
+// 2. MANAGEMENT STATE & DATABASE OPERATIONS
+// ==========================================
+
+// Fungsi memuat data dari Supabase (Asinkron)
+async function loadDataFromSupabase() {
+  try {
+    // Muat state lokal UI dari LocalStorage browser masing-masing
+    const localSaved = localStorage.getItem("bibo-obi-sowi-local-state");
+    if (localSaved) {
+      const parsed = JSON.parse(localSaved);
+      state.activeUserId = parsed.activeUserId || null;
+      state.page = parsed.page || "dashboard";
+      state.filters = parsed.filters || { q: "", status: "All" };
+      state.editingId = parsed.editingId || null;
+    }
+
+    // Ambil data bisnis dari Supabase secara paralel
+    const [reqs, depts, cats, notifs] = await Promise.all([
+      supabaseClient.from('requests').select('*').order('createdAt', { ascending: false }),
+      supabaseClient.from('departments').select('name').order('name'),
+      supabaseClient.from('categories').select('name').order('name'),
+      supabaseClient.from('notifications').select('*').order('date', { ascending: false })
+    ]);
+
+    if (reqs.error) throw reqs.error;
+    if (depts.error) throw depts.error;
+    if (cats.error) throw cats.error;
+    if (notifs.error) throw notifs.error;
+
+    state.requests = reqs.data || [];
+    state.departments = (depts.data || []).map(d => d.name);
+    state.categories = (cats.data || []).map(c => c.name);
+    state.notifications = notifs.data || [];
+
+    render();
+  } catch (error) {
+    console.error("Gagal sinkronisasi data dengan Supabase:", error);
+    showToast("Gagal memuat data dari Supabase: " + error.message);
+    render(); // Tetap render dengan data seadanya
+  }
 }
 
+// Fungsi menyimpan State UI secara lokal
 function saveState() {
-  const safe = { ...state, sidebarOpen: false };
-  localStorage.setItem("bibo-obi-sowi-state", JSON.stringify(safe));
+  const localState = {
+    activeUserId: state.activeUserId,
+    page: state.page,
+    filters: state.filters,
+    editingId: state.editingId
+  };
+  localStorage.setItem("bibo-obi-sowi-local-state", JSON.stringify(localState));
 }
 
 function currentUser() {
@@ -62,6 +113,7 @@ function formatMoney(value) {
   }).format(Number(value || 0));
 }
 
+// Format tanggal hari ini
 function today() {
   return new Date().toISOString().slice(0, 10);
 }
@@ -126,13 +178,23 @@ function approvalStep(request) {
   return APPROVERS[request.currentLevel - 1] || null;
 }
 
-function notify(message, requestId) {
-  state.notifications.unshift({
+// Mengirim notifikasi dan menyimpannya ke database Supabase
+async function notify(message, requestId) {
+  const newNotif = {
     id: crypto.randomUUID(),
     message,
     requestId,
     date: new Date().toISOString()
-  });
+  };
+
+  try {
+    const { error } = await supabaseClient.from('notifications').insert(newNotif);
+    if (error) throw error;
+    state.notifications.unshift(newNotif);
+  } catch (err) {
+    console.error("Gagal mengirim notifikasi ke database:", err);
+  }
+
   showToast(message);
 }
 
@@ -165,14 +227,39 @@ function logout() {
   render();
 }
 
-function resetDemoData() {
-  if (!confirm("Kosongkan seluruh request, master departemen, kategori, dan notifikasi?")) return;
-  state = { ...structuredClone(DEFAULT_STATE), activeUserId: state.activeUserId };
-  saveState();
-  render();
+// Mengosongkan seluruh data di database Supabase
+async function resetDemoData() {
+  if (!confirm("Kosongkan seluruh request, master departemen, kategori, dan notifikasi di database Supabase?")) return;
+
+  try {
+    const [err1, err2, err3, err4] = await Promise.all([
+      supabaseClient.from('notifications').delete().neq('id', '00000000-0000-0000-0000-000000000000'),
+      supabaseClient.from('requests').delete().neq('id', '00000000-0000-0000-0000-000000000000'),
+      supabaseClient.from('departments').delete().neq('name', ''),
+      supabaseClient.from('categories').delete().neq('name', '')
+    ]);
+
+    if (err1.error) throw err1.error;
+    if (err2.error) throw err2.error;
+    if (err3.error) throw err3.error;
+    if (err4.error) throw err4.error;
+
+    state.requests = [];
+    state.departments = [];
+    state.categories = [];
+    state.notifications = [];
+
+    saveState();
+    render();
+    showToast("Database Supabase berhasil dikosongkan.");
+  } catch (err) {
+    console.error("Gagal mengosongkan database:", err);
+    showToast("Gagal mengosongkan database: " + err.message);
+  }
 }
 
-function deleteRequest(id) {
+// Menghapus data request beserta notifikasinya di database Supabase
+async function deleteRequest(id) {
   const user = currentUser();
   if (!canAdmin(user)) {
     showToast("Hanya Admin yang dapat menghapus riwayat pengajuan.");
@@ -183,12 +270,22 @@ function deleteRequest(id) {
   if (!request) return;
   if (!confirm(`Hapus riwayat pengajuan ${request.number}? Data ini tidak dapat dikembalikan.`)) return;
 
-  state.requests = state.requests.filter((item) => item.id !== id);
-  state.notifications = state.notifications.filter((item) => item.requestId !== id);
-  if (state.modal?.id === id) state.modal = null;
-  saveState();
-  render();
-  showToast(`${request.number} berhasil dihapus.`);
+  try {
+    // Karena CASCADE foreign key, menghapus dari 'requests' otomatis menghapus 'notifications' terkait
+    const { error } = await supabaseClient.from('requests').delete().eq('id', id);
+    if (error) throw error;
+
+    state.requests = state.requests.filter((item) => item.id !== id);
+    state.notifications = state.notifications.filter((item) => item.requestId !== id);
+    if (state.modal?.id === id) state.modal = null;
+
+    saveState();
+    render();
+    showToast(`${request.number} berhasil dihapus.`);
+  } catch (err) {
+    console.error("Gagal menghapus request dari database:", err);
+    showToast("Gagal menghapus data: " + err.message);
+  }
 }
 
 function navItems(user) {
@@ -202,6 +299,10 @@ function navItems(user) {
   ];
   return items;
 }
+
+// ==========================================
+// 3. UI RENDERING LOGIC
+// ==========================================
 
 function render() {
   const app = document.querySelector("#app");
@@ -247,7 +348,7 @@ function renderLogin() {
       <div class="auth-panel">
         <form class="login-box" onsubmit="event.preventDefault(); login(document.querySelector('#loginUser').value)">
           <h2>Masuk ke platform</h2>
-          <p class="helper">Pilih akun untuk simulasi role. Data request masih kosong dan siap digunakan.</p>
+          <p class="helper">Pilih akun untuk simulasi role. Data request dimuat langsung dari Supabase.</p>
           <div class="field">
             <label for="loginUser">User</label>
             <select id="loginUser">
@@ -275,8 +376,8 @@ function renderSidebar(user) {
       </div>
       <nav class="nav">
         ${navItems(user)
-          .map(([id, label]) => `<button class="btn ${state.page === id ? "active" : ""}" onclick="setPage('${id}')">${label}</button>`)
-          .join("")}
+      .map(([id, label]) => `<button class="btn ${state.page === id ? "active" : ""}" onclick="setPage('${id}')">${label}</button>`)
+      .join("")}
       </nav>
       <div class="side-bottom">
         <div class="user-card">
@@ -386,15 +487,15 @@ function renderMiniTimeline(rows) {
   return `
     <div class="timeline">
       ${rows
-        .map(
-          (request) => `
+      .map(
+        (request) => `
             <div class="timeline-item">
               <strong>${escapeHtml(request.title)}</strong>
               <small>${escapeHtml(request.number)} · ${escapeHtml(request.status)} · ${formatMoney(request.amount)}</small>
             </div>
           `
-        )
-        .join("")}
+      )
+      .join("")}
     </div>
   `;
 }
@@ -413,7 +514,7 @@ function renderRequestForm(user) {
       <div class="section-title">
         <div>
           <h2>${request ? "Edit Pengajuan" : "Buat Pengajuan Budget"}</h2>
-          <p class="helper">${isRevision ? "Perbarui data dan lampiran, lalu kirim revisi kembali ke approver yang meminta revisi." : "Pengajuan dapat disimpan sebagai Draft atau langsung Submitted ke approval berjenjang."}</p>
+          <p class="helper">${isRevision ? "Perbarui data dan lampiran, lalu kirim revisi kembali ke approver yang meminta revisi." : "Pengajuan akan disimpan langsung ke database Supabase Cloud."}</p>
         </div>
       </div>
       <div class="form-grid">
@@ -429,8 +530,8 @@ function renderRequestForm(user) {
           <label>Nama Requester</label>
           <select name="requesterId" required ${user.role !== "Admin" ? "disabled" : ""}>
             ${requesterOptions
-              .map((item) => `<option value="${item.id}" ${item.id === (request?.requesterId || user.id) ? "selected" : ""}>${item.name}</option>`)
-              .join("")}
+      .map((item) => `<option value="${item.id}" ${item.id === (request?.requesterId || user.id) ? "selected" : ""}>${item.name}</option>`)
+      .join("")}
           </select>
         </div>
         <div class="field">
@@ -456,7 +557,7 @@ function renderRequestForm(user) {
         <div class="field full">
           <label>Lampiran</label>
           <input type="file" name="attachment" />
-          <p class="helper">${request?.attachmentName ? `Lampiran saat ini: ${escapeHtml(request.attachmentName)}. Pilih file baru untuk mengganti.` : "Lampiran akan tersimpan di browser dan dapat dilihat dari Detail."}</p>
+          <p class="helper">${request?.attachmentName ? `Lampiran saat ini: ${escapeHtml(request.attachmentName)}. Pilih file baru untuk mengganti.` : "Lampiran akan tersimpan di Supabase database (dalam format Base64) dan dapat dilihat dari Detail."}</p>
         </div>
         <div class="field full">
           <label>Catatan Approval</label>
@@ -486,6 +587,7 @@ function renderSelectOrInput(name, values, current) {
   `;
 }
 
+// Fungsi menyimpan/edit request baru ke Supabase
 async function saveRequest(event) {
   const form = event.target;
   const submitter = event.submitter?.value || "Draft";
@@ -495,55 +597,75 @@ async function saveRequest(event) {
   const file = form.attachment.files[0];
   const existing = state.requests.find((item) => item.id === state.editingId);
   const status = submitter === "Submitted" ? "Pending Approval" : existing?.status === "Revision" ? "Revision" : "Draft";
-  const attachment = (await readFileAsDataUrl(file)) || existing?.attachment || null;
-  const isRevisionResubmit = existing?.status === "Revision" && status === "Pending Approval";
-  const request = {
-    id: existing?.id || crypto.randomUUID(),
-    number: data.get("number"),
-    date: data.get("date"),
-    requesterId: requester.id,
-    requesterName: requester.name,
-    department: data.get("department"),
-    category: data.get("category"),
-    title: data.get("title"),
-    description: data.get("description"),
-    amount: Number(data.get("amount")),
-    attachment,
-    attachmentName: attachment?.name || existing?.attachmentName || "",
-    approvalNote: data.get("approvalNote"),
-    status,
-    currentLevel: status === "Pending Approval" ? existing?.currentLevel || 1 : existing?.currentLevel || 1,
-    createdAt: existing?.createdAt || new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    history: [
-      ...(existing?.history || []),
-      {
-        date: new Date().toISOString(),
-        actor: active.name,
-        action: isRevisionResubmit ? "Revision resubmitted" : existing ? `Updated as ${status}` : `Created as ${status}`,
-        comment: data.get("approvalNote") || "-"
-      }
-    ]
-  };
 
   if (existing) {
     if (!["Draft", "Revision"].includes(existing.status) && !canAdmin(active)) {
       showToast("Hanya Draft atau Revision yang dapat diedit.");
       return;
     }
-    state.requests = state.requests.map((item) => (item.id === existing.id ? request : item));
-  } else {
-    state.requests.push(request);
   }
 
-  if (status === "Pending Approval") {
-    const approverName = USERS.find((u) => u.id === approvalStep(request))?.name;
-    notify(isRevisionResubmit ? `${request.number} revisi dikirim kembali ke approval ${approverName}.` : `${request.number} dikirim ke approval ${approverName}.`, request.id);
+  const submitBtn = event.submitter;
+  if (submitBtn) submitBtn.disabled = true;
+
+  try {
+    const attachment = (await readFileAsDataUrl(file)) || existing?.attachment || null;
+    const isRevisionResubmit = existing?.status === "Revision" && status === "Pending Approval";
+
+    const request = {
+      id: existing?.id || crypto.randomUUID(),
+      number: data.get("number"),
+      date: data.get("date"),
+      requesterId: requester.id,
+      requesterName: requester.name,
+      department: data.get("department"),
+      category: data.get("category"),
+      title: data.get("title"),
+      description: data.get("description"),
+      amount: Number(data.get("amount")),
+      attachment,
+      attachmentName: attachment?.name || existing?.attachmentName || "",
+      approvalNote: data.get("approvalNote"),
+      status,
+      currentLevel: status === "Pending Approval" ? existing?.currentLevel || 1 : existing?.currentLevel || 1,
+      createdAt: existing?.createdAt || new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      history: [
+        ...(existing?.history || []),
+        {
+          date: new Date().toISOString(),
+          actor: active.name,
+          action: isRevisionResubmit ? "Revision resubmitted" : existing ? `Updated as ${status}` : `Created as ${status}`,
+          comment: data.get("approvalNote") || "-"
+        }
+      ]
+    };
+
+    // PENTING: Menyimpan/Mengupdate data di Supabase database
+    const { error } = await supabaseClient.from('requests').upsert(request);
+    if (error) throw error;
+
+    if (existing) {
+      state.requests = state.requests.map((item) => (item.id === existing.id ? request : item));
+    } else {
+      state.requests.unshift(request);
+    }
+
+    if (status === "Pending Approval") {
+      const approverName = USERS.find((u) => u.id === approvalStep(request))?.name;
+      await notify(isRevisionResubmit ? `${request.number} revisi dikirim kembali ke approval ${approverName}.` : `${request.number} dikirim ke approval ${approverName}.`, request.id);
+    }
+
+    state.editingId = null;
+    state.page = "history";
+    saveState();
+    render();
+  } catch (err) {
+    console.error("Gagal menyimpan pengajuan ke database:", err);
+    showToast("Gagal menyimpan ke Supabase: " + err.message);
+  } finally {
+    if (submitBtn) submitBtn.disabled = false;
   }
-  state.editingId = null;
-  state.page = "history";
-  saveState();
-  render();
 }
 
 function renderApproval(user) {
@@ -599,8 +721,8 @@ function renderTable(rows, options = {}) {
         </thead>
         <tbody>
           ${rows
-            .map(
-              (request) => `
+      .map(
+        (request) => `
                 <tr>
                   <td><strong>${escapeHtml(request.number)}</strong></td>
                   <td>${escapeHtml(request.date)}</td>
@@ -613,8 +735,8 @@ function renderTable(rows, options = {}) {
                   <td>${renderActions(request, options)}</td>
                 </tr>
               `
-            )
-            .join("")}
+      )
+      .join("")}
         </tbody>
       </table>
     </div>
@@ -673,11 +795,15 @@ function renderModal() {
   `;
 }
 
-function decideRequest(event) {
+// Mengambil keputusan approval dan memperbaruinya di database Supabase
+async function decideRequest(event) {
   const request = state.requests.find((item) => item.id === state.modal.id);
   const user = currentUser();
   const comment = new FormData(event.target).get("comment");
   let message = "";
+
+  const submitBtn = event.target.querySelector("button[type='submit']");
+  if (submitBtn) submitBtn.disabled = true;
 
   if (state.modal.decision === "approve") {
     if (request.currentLevel >= APPROVERS.length) {
@@ -707,10 +833,30 @@ function decideRequest(event) {
     action: state.modal.decision,
     comment
   });
-  state.modal = null;
-  notify(message, request.id);
-  saveState();
-  render();
+
+  try {
+    // Perbarui record di tabel requests
+    const { error } = await supabaseClient
+      .from('requests')
+      .update({
+        status: request.status,
+        currentLevel: request.currentLevel,
+        updatedAt: request.updatedAt,
+        history: request.history
+      })
+      .eq('id', request.id);
+
+    if (error) throw error;
+
+    state.modal = null;
+    await notify(message, request.id);
+    saveState();
+    render();
+  } catch (err) {
+    console.error("Gagal menyimpan keputusan approval:", err);
+    showToast("Gagal menyimpan keputusan: " + err.message);
+    if (submitBtn) submitBtn.disabled = false;
+  }
 }
 
 function viewDetail(id) {
@@ -782,9 +928,8 @@ function renderDetailModal(request) {
             <div class="detail-section-title">
               <span>Lampiran</span>
             </div>
-            ${
-              attachment
-                ? `<div class="attachment-box">
+            ${attachment
+      ? `<div class="attachment-box">
                     <div class="attachment-icon">DOC</div>
                     <div class="attachment-info">
                       <strong>${escapeHtml(attachment.name)}</strong>
@@ -795,8 +940,8 @@ function renderDetailModal(request) {
                       <button class="btn primary small-btn" type="button" onclick="downloadAttachment('${request.id}')">Unduh</button>
                     </div>
                   </div>`
-                : `<div class="attachment-empty">Tidak ada lampiran pada request ini.</div>`
-            }
+      : `<div class="attachment-empty">Tidak ada lampiran pada request ini.</div>`
+    }
           </div>
 
           <div class="detail-section">
@@ -805,8 +950,8 @@ function renderDetailModal(request) {
             </div>
             <div class="approval-steps">
               ${request.history
-                .map(
-                  (item) => `
+      .map(
+        (item) => `
                     <div class="approval-step">
                       <div class="approval-dot"></div>
                       <div>
@@ -816,8 +961,8 @@ function renderDetailModal(request) {
                       </div>
                     </div>
                   `
-                )
-                .join("")}
+      )
+      .join("")}
             </div>
           </div>
         </div>
@@ -857,7 +1002,7 @@ function renderAdmin() {
     <div class="section-title">
       <div>
         <h2>Master Data</h2>
-        <p class="helper">Kelola user referensi, departemen, dan kategori budget. Data request tetap kosong sampai dibuat.</p>
+        <p class="helper">Kelola user referensi, departemen, dan kategori budget di database Supabase.</p>
       </div>
       <button class="btn danger" onclick="resetDemoData()">Kosongkan Data</button>
     </div>
@@ -873,7 +1018,7 @@ function renderAdmin() {
     </div>
     <div class="panel" style="margin-top:16px">
       <div class="panel-title"><h2>Seluruh Data Pengajuan</h2></div>
-      ${state.requests.length ? renderTable(state.requests, { history: true }) : emptyState("Belum ada pengajuan", "Admin akan melihat semua data setelah request dibuat.")}
+      ${state.requests.length ? renderTable(state.requests, { history: true }) : emptyState("Belum ada pengajuan", "Seluruh data pengajuan dari database akan dimuat di sini.")}
     </div>
   `;
 }
@@ -896,18 +1041,37 @@ function renderMasterPanel(title, key) {
   `;
 }
 
-function addMaster(key, value) {
+// Menambahkan data master ke Supabase
+async function addMaster(key, value) {
   const clean = value.trim();
   if (!clean || state[key].includes(clean)) return;
-  state[key].push(clean);
-  saveState();
-  render();
+
+  try {
+    const { error } = await supabaseClient.from(key).insert({ name: clean });
+    if (error) throw error;
+
+    state[key].push(clean);
+    saveState();
+    render();
+  } catch (err) {
+    console.error(`Gagal menyimpan ${key} ke Supabase:`, err);
+    showToast("Gagal menyimpan: " + err.message);
+  }
 }
 
-function removeMaster(key, value) {
-  state[key] = state[key].filter((item) => item !== value);
-  saveState();
-  render();
+// Menghapus data master dari Supabase
+async function removeMaster(key, value) {
+  try {
+    const { error } = await supabaseClient.from(key).delete().eq('name', value);
+    if (error) throw error;
+
+    state[key] = state[key].filter((item) => item !== value);
+    saveState();
+    render();
+  } catch (err) {
+    console.error(`Gagal menghapus ${key} dari Supabase:`, err);
+    showToast("Gagal menghapus: " + err.message);
+  }
 }
 
 function renderNotifications() {
@@ -915,25 +1079,41 @@ function renderNotifications() {
     <div class="section-title">
       <div>
         <h2>Notifikasi Status</h2>
-        <p class="helper">Notifikasi muncul ketika status atau level approval berubah.</p>
+        <p class="helper">Notifikasi disinkronkan langsung dari Supabase database.</p>
       </div>
-      <button class="btn ghost" onclick="state.notifications=[]; saveState(); render()">Bersihkan</button>
+      <button class="btn ghost" onclick="clearAllNotifications()">Bersihkan</button>
     </div>
     <div class="notification-list">
       ${state.notifications.length
-        ? state.notifications
-            .map(
-              (item) => `
+      ? state.notifications
+        .map(
+          (item) => `
                 <div class="notification">
                   <strong>${escapeHtml(item.message)}</strong>
                   <small>${new Date(item.date).toLocaleString("id-ID")}</small>
                 </div>
               `
-            )
-            .join("")
-        : emptyState("Belum ada notifikasi", "Notifikasi akan tampil saat status pengajuan berubah.")}
+        )
+        .join("")
+      : emptyState("Belum ada notifikasi", "Notifikasi akan tampil saat status pengajuan berubah.")}
     </div>
   `;
+}
+
+// Menghapus seluruh notifikasi dari Supabase
+async function clearAllNotifications() {
+  try {
+    const { error } = await supabaseClient.from('notifications').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+    if (error) throw error;
+
+    state.notifications = [];
+    saveState();
+    render();
+    showToast("Semua notifikasi dibersihkan.");
+  } catch (err) {
+    console.error("Gagal membersihkan notifikasi:", err);
+    showToast("Gagal membersihkan: " + err.message);
+  }
 }
 
 function emptyState(title, description) {
@@ -970,4 +1150,5 @@ function exportExcel() {
   URL.revokeObjectURL(link.href);
 }
 
-render();
+// Inisialisasi awal: Muat data dari database Supabase
+loadDataFromSupabase();
